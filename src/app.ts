@@ -52,20 +52,39 @@ function hasBody(method: string): boolean {
   return method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 }
 
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://forge').pathname;
-  } catch {
-    return '/';
-  }
+/** The path without its query string. The router decodes segments itself, so no URL parse is needed. */
+function pathnameOf(req: IncomingMessage): string {
+  const raw = req.url ?? '/';
+  const query = raw.indexOf('?');
+  return (query < 0 ? raw : raw.slice(0, query)) || '/';
 }
 
-function urlOf(req: IncomingMessage): URL {
-  try {
-    return new URL(req.url ?? '/', 'http://forge');
-  } catch {
-    return new URL('/', 'http://forge');
-  }
+/** A context whose URL is parsed only for handlers that actually read query parameters. */
+function contextOf(
+  req: IncomingMessage,
+  res: ServerResponse,
+  params: Record<string, string>,
+  body: unknown,
+  rawBody?: Buffer,
+): RequestContext {
+  let parsed: URL | undefined;
+  return {
+    req,
+    res,
+    params,
+    body,
+    rawBody,
+    get url(): URL {
+      if (parsed === undefined) {
+        try {
+          parsed = new URL(req.url ?? '/', 'http://forge');
+        } catch {
+          parsed = new URL('/', 'http://forge');
+        }
+      }
+      return parsed;
+    },
+  };
 }
 
 async function dispatch(
@@ -74,7 +93,7 @@ async function dispatch(
   router: Router,
 ): Promise<void> {
   const method = (req.method ?? 'GET').toUpperCase();
-  const pathname = pathOf(req);
+  const pathname = pathnameOf(req);
 
   // The env's boot probe, and the only route that takes no token.
   if (method === 'GET' && pathname === '/healthz') {
@@ -97,7 +116,7 @@ async function dispatch(
       if (pathname === '/mcp') rawBody = await readBody(req, MAX_JSON_BODY_BYTES);
       else graphBody = await readJsonBody(req, MAX_JSON_BODY_BYTES);
     }
-    const context: RequestContext = { req, res, url: urlOf(req), params: graphFound.params, body: graphBody, rawBody };
+    const context: RequestContext = contextOf(req, res, graphFound.params, graphBody, rawBody);
     await graphFound.handler(context);
     return;
   }
@@ -111,7 +130,7 @@ async function dispatch(
       return;
     }
     requireAuth(req);
-    const ctx: RequestContext = { req, res, url: urlOf(req), params: found.params, body: undefined };
+    const ctx: RequestContext = contextOf(req, res, found.params, undefined);
     await found.handler(ctx);
     return;
   }
@@ -130,13 +149,7 @@ async function dispatch(
     throw new HttpError(404, 'Not Found');
   }
 
-  const ctx: RequestContext = {
-    req,
-    res,
-    url: urlOf(req),
-    params: found.params,
-    body,
-  };
+  const ctx: RequestContext = contextOf(req, res, found.params, body);
   await found.handler(ctx);
 }
 
@@ -168,7 +181,7 @@ export function createApp(): Server {
   router.get('/mcp', (ctx) => mcpMethodNotAllowed(ctx.res));
   registerGitRoutes(router, store);
 
-  return createServer((req, res) => {
+  const server = createServer((req, res) => {
     res.setHeader('x-github-request-id', nextRequestId());
     // The suite never asks for HTML; a conservative no-sniff header keeps intermediaries honest.
     res.setHeader('x-content-type-options', 'nosniff');
@@ -182,6 +195,13 @@ export function createApp(): Server {
       sendError(res, err);
     });
   });
+  // Keep connections alive across benchmark requests and flush small writes immediately.
+  server.keepAliveTimeout = 75_000;
+  server.headersTimeout = 76_000;
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
 }
 
 /** For tests and future surfaces: the store a server was built with is private by design. */

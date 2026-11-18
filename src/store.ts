@@ -109,6 +109,16 @@ export class Store {
   private repoSeq = 0;
   private clockMs = STORE_EPOCH_MS;
 
+  /**
+   * A deterministic mutation counter. Every path that changes observable state calls `tick()`, so a
+   * serialized GET response is valid exactly while its cached revision matches this one.
+   */
+  revision = 0;
+  /** Serialized issue bodies, keyed by repo/number/origin. */
+  readonly issueCache = new Map<string, { revision: number; body: Buffer }>();
+  /** Serialized git bodies (advertisements, ls-refs and packs), keyed by repo/request. */
+  readonly gitCache = new Map<string, { revision: number; body: Buffer }>();
+
   constructor() {
     this.viewer = {
       id: 1000,
@@ -122,6 +132,7 @@ export class Store {
   tick(): string {
     const stamp = new Date(this.clockMs).toISOString();
     this.clockMs += 1_000;
+    this.revision += 1;
     return stamp;
   }
 

@@ -342,8 +342,44 @@ function parseFetchRequest(lines: readonly string[]): FetchRequest {
   return { wants, haves, shallow, depth };
 }
 
-function handleFetchV2(repo: Repo, lines: readonly string[]): Buffer {
+/**
+ * A fresh shallow fetch (a shallow clone) depends only on the wanted tip and the depth, both of
+ * which are part of the key.  Anything the client already has makes the reply client-specific.
+ */
+function shallowFetchKey(
+  protocol: string,
+  repo: Repo,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallow: readonly string[],
+  depth: number | undefined,
+): string | null {
+  if (depth === undefined || haves.length > 0 || shallow.length > 0) return null;
+  return `${protocol}:${repo.owner}/${repo.name}:deepen=${depth}:${wants.join(' ')}`;
+}
+
+function gitCacheGet(store: Store, key: string): Buffer | undefined {
+  const hit = store.gitCache.get(key);
+  return hit !== undefined && hit.revision === store.revision ? hit.body : undefined;
+}
+
+function gitCacheSet(store: Store, key: string, body: Buffer): void {
+  const revision = store.revision;
+  if (store.gitCache.size >= 512) {
+    for (const [entryKey, entry] of store.gitCache) {
+      if (entry.revision !== revision) store.gitCache.delete(entryKey);
+    }
+  }
+  store.gitCache.set(key, { revision, body });
+}
+
+function handleFetchV2(repo: Repo, lines: readonly string[], store: Store): Buffer {
   const request = parseFetchRequest(lines);
+  const cacheKey = shallowFetchKey('v2', repo, request.wants, request.haves, request.shallow, request.depth);
+  if (cacheKey !== null) {
+    const cached = gitCacheGet(store, cacheKey);
+    if (cached !== undefined) return cached;
+  }
   const selection = selectFetch(repo, request.wants, request.haves, request.shallow, request.depth);
   const pack = writePack(selection.objects.values());
   const parts: Buffer[] = [];
@@ -363,10 +399,12 @@ function handleFetchV2(repo: Repo, lines: readonly string[]): Buffer {
   parts.push(encodePktLine('packfile\n'));
   parts.push(sidebandPackets(1, pack));
   parts.push(flushPacket());
-  return Buffer.concat(parts);
+  const response = Buffer.concat(parts);
+  if (cacheKey !== null) gitCacheSet(store, cacheKey, response);
+  return response;
 }
 
-function handleFetchV0(repo: Repo, packets: readonly PktLinePacket[]): Buffer {
+function handleFetchV0(repo: Repo, packets: readonly PktLinePacket[], store: Store): Buffer {
   const lines = packetLines(packets).map((line) => line.replace(/\r?\n$/, ''));
   const wants: string[] = [];
   const haves: string[] = [];
@@ -383,6 +421,11 @@ function handleFetchV0(repo: Repo, packets: readonly PktLinePacket[]): Buffer {
   for (const oid of [...wants, ...haves, ...shallow]) {
     if (!isObjectId(oid)) throw new HttpError(400, `Invalid object id ${JSON.stringify(oid)}`);
   }
+  const cacheKey = shallowFetchKey('v0', repo, wants, haves, shallow, depth);
+  if (cacheKey !== null) {
+    const cached = gitCacheGet(store, cacheKey);
+    if (cached !== undefined) return cached;
+  }
   const selection = selectFetch(repo, wants, haves, shallow, depth);
   const pack = writePack(selection.objects.values());
   const parts: Buffer[] = [];
@@ -391,7 +434,9 @@ function handleFetchV0(repo: Repo, packets: readonly PktLinePacket[]): Buffer {
   parts.push(encodePktLine('NAK\n'));
   parts.push(sidebandPackets(1, pack));
   parts.push(flushPacket());
-  return Buffer.concat(parts);
+  const response = Buffer.concat(parts);
+  if (cacheKey !== null) gitCacheSet(store, cacheKey, response);
+  return response;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -543,10 +588,10 @@ export function registerGitRoutes(router: Router, store: Store): void {
         const lines = requestLines(body);
         const command = commandOf(lines);
         if (command === 'ls-refs') response = handleLsRefs(repo, lines);
-        else if (command === 'fetch') response = handleFetchV2(repo, lines);
+        else if (command === 'fetch') response = handleFetchV2(repo, lines, store);
         else throw new HttpError(400, `Unsupported command ${JSON.stringify(command)}`);
       } else {
-        response = handleFetchV0(repo, decodePktLines(body));
+        response = handleFetchV0(repo, decodePktLines(body), store);
       }
     } catch (err) {
       if (err instanceof PktLineError) throw new HttpError(400, err.message);

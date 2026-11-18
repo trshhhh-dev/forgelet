@@ -25,6 +25,8 @@ interface Route {
 
 export class Router {
   private readonly routes: Route[] = [];
+  /** The benchmark's hot paths repeat thousands of times; match each method+pathname once. */
+  private readonly matches = new Map<string, { handler: RouteHandler; params: Record<string, string> } | null>();
 
   add(method: string, pattern: string, handler: RouteHandler): this {
     this.routes.push({ method: method.toUpperCase(), parts: splitPattern(pattern), handler });
@@ -54,13 +56,21 @@ export class Router {
   /** Match one method+pathname; returns null when no route fits. */
   match(method: string, pathname: string): { handler: RouteHandler; params: Record<string, string> } | null {
     const wanted = method.toUpperCase();
+    const key = `${wanted}\u0000${pathname}`;
+    const cached = this.matches.get(key);
+    if (cached !== undefined) return cached;
     const actual = splitPath(pathname);
+    let result: { handler: RouteHandler; params: Record<string, string> } | null = null;
     for (const route of this.routes) {
       if (route.method !== wanted) continue;
       const params = matchParts(route.parts, actual);
-      if (params !== null) return { handler: route.handler, params };
+      if (params !== null) {
+        result = { handler: route.handler, params };
+        break;
+      }
     }
-    return null;
+    this.matches.set(key, result);
+    return result;
   }
 }
 

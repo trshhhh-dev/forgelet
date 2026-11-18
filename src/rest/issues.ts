@@ -4,7 +4,7 @@
 // store, never from a clock, which keeps two runs byte-identical.
 
 import type { Router } from '../router.ts';
-import { HttpError, asObject, optionalString, requireString, sendJson } from '../http.ts';
+import { HttpError, JSON_CONTENT_TYPE, asObject, optionalString, requireString, sendBuffer, sendJson } from '../http.ts';
 import type { Comment, Issue, Label, Repo, Store } from '../store.ts';
 import { originOf, userJson } from './repos.ts';
 
@@ -24,6 +24,33 @@ function requireIssue(repo: Repo, raw: unknown): Issue {
   const issue = Number.isSafeInteger(number) ? repo.issues.find((entry) => entry.number === number) : undefined;
   if (issue === undefined) throw new HttpError(404, 'Not Found');
   return issue;
+}
+
+/**
+ * Serialize an issue body once per store revision and reuse the bytes.  A revision bump (any
+ * mutation anywhere in the forge) invalidates every entry, so a cached body is byte-identical to a
+ * freshly built one.
+ */
+function sendIssueJsonCached(
+  store: Store,
+  res: Parameters<typeof sendBuffer>[0],
+  key: string,
+  build: () => Record<string, unknown>,
+): void {
+  const revision = store.revision;
+  const hit = store.issueCache.get(key);
+  if (hit !== undefined && hit.revision === revision) {
+    sendBuffer(res, 200, hit.body, { 'content-type': JSON_CONTENT_TYPE });
+    return;
+  }
+  const payload = Buffer.from(`${JSON.stringify(build())}\n`, 'utf8');
+  if (store.issueCache.size >= 512) {
+    for (const [entryKey, entry] of store.issueCache) {
+      if (entry.revision !== revision) store.issueCache.delete(entryKey);
+    }
+  }
+  store.issueCache.set(key, { revision, body: payload });
+  sendBuffer(res, 200, payload, { 'content-type': JSON_CONTENT_TYPE });
 }
 
 function labelJson(repo: Repo, label: Label, origin: string): Record<string, unknown> {
@@ -243,7 +270,9 @@ export function registerIssueRoutes(router: Router, store: Store): void {
   router.get('/api/v3/repos/:owner/:repo/issues/:number', (ctx) => {
     const repo = requireRepo(store, ctx.params.owner, ctx.params.repo);
     const issue = requireIssue(repo, ctx.params.number);
-    sendJson(ctx.res, 200, issueJson(store, repo, issue, originOf(ctx)));
+    const origin = originOf(ctx);
+    const cacheKey = `${repo.owner}/${repo.name}#${issue.number}@${origin}`;
+    sendIssueJsonCached(store, ctx.res, cacheKey, () => issueJson(store, repo, issue, origin));
   });
 
   router.patch('/api/v3/repos/:owner/:repo/issues/:number', (ctx) => {
