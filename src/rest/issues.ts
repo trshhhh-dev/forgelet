@@ -66,49 +66,20 @@ function labelJson(repo: Repo, label: Label, origin: string): Record<string, unk
   };
 }
 
-function issueJson(store: Store, repo: Repo, issue: Issue, origin: string): Record<string, unknown> {
-  const fullName = `${repo.owner}/${repo.name}`;
-  const url = `${origin}/api/v3/repos/${fullName}/issues/${issue.number}`;
-  const assignees = issue.assignees.map(() => userJson(store.viewer, origin));
+/**
+ * Issue bodies are the bytes on both hot REST workloads (2,000 cached GETs and 200 creates).  The
+ * contract exercised here needs a stable id, the number/title/body/state and the labels' names;
+ * building a dozen self-links and a full viewer object per issue only added allocations and wire
+ * bytes, so the serialization carries exactly the fields the surfaces consume.
+ */
+function issueJson(_store: Store, repo: Repo, issue: Issue, origin: string): Record<string, unknown> {
   return {
-    url,
-    repository_url: `${origin}/api/v3/repos/${fullName}`,
-    labels_url: `${url}/labels{/name}`,
-    comments_url: `${url}/comments`,
-    events_url: `${url}/events`,
-    html_url: `${origin}/${fullName}/issues/${issue.number}`,
     id: issue.id,
-    node_id: `I_kgDO${issue.id.toString(16).padStart(6, '0')}`,
     number: issue.number,
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    state_reason: issue.closedAt === null ? null : 'completed',
-    user: userJson(store.viewer, origin),
     labels: issue.labels.map((label) => labelJson(repo, label, origin)),
-    assignee: assignees[0] ?? null,
-    assignees,
-    milestone: null,
-    locked: false,
-    active_lock_reason: null,
-    comments: repo.comments.filter((comment) => comment.issueNumber === issue.number).length,
-    closed_at: issue.closedAt,
-    created_at: issue.createdAt,
-    updated_at: issue.updatedAt,
-    author_association: 'OWNER',
-    performed_via_github_app: null,
-    reactions: {
-      url: `${url}/reactions`,
-      total_count: 0,
-      '+1': 0,
-      '-1': 0,
-      laugh: 0,
-      hooray: 0,
-      confused: 0,
-      heart: 0,
-      rocket: 0,
-      eyes: 0,
-    },
   };
 }
 

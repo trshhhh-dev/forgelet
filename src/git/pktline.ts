@@ -149,16 +149,40 @@ export function packetLines(packets: readonly PktLinePacket[]): string[] {
  * run longer than one pkt-line is split; each packet is one band byte plus at most 65515 data bytes.
  */
 export function sidebandPackets(band: 1 | 2 | 3, data: Uint8Array): Buffer {
-  const buffer = Buffer.from(data);
-  const parts: Buffer[] = [];
-  let offset = 0;
+  const out = Buffer.allocUnsafe(sidebandLength(data.length));
+  writeSidebandPackets(out, 0, band, data);
+  return out;
+}
+
+/** Exact byte length of `sidebandPackets(band, data)`. */
+export function sidebandLength(dataLength: number): number {
+  const chunk = PKT_LINE_MAX_PAYLOAD - 1;
+  const packets = Math.max(1, Math.ceil(dataLength / chunk));
+  return dataLength + packets * 5;
+}
+
+const HEX_DIGITS = '0123456789abcdef';
+
+/** Write a four-digit lowercase hex pkt-line length; the caller guarantees `length <= 65520`. */
+export function writePktHeader(out: Buffer, offset: number, length: number): void {
+  out[offset] = HEX_DIGITS.charCodeAt((length >>> 12) & 0x0f);
+  out[offset + 1] = HEX_DIGITS.charCodeAt((length >>> 8) & 0x0f);
+  out[offset + 2] = HEX_DIGITS.charCodeAt((length >>> 4) & 0x0f);
+  out[offset + 3] = HEX_DIGITS.charCodeAt(length & 0x0f);
+}
+
+/** Write sideband packets straight into `out`, avoiding the intermediate payload and concat copies. */
+export function writeSidebandPackets(out: Buffer, offset: number, band: 1 | 2 | 3, data: Uint8Array): number {
+  let source = 0;
+  let at = offset;
   do {
-    const take = Math.min(PKT_LINE_MAX_PAYLOAD - 1, buffer.length - offset);
-    const payload = Buffer.allocUnsafe(take + 1);
-    payload[0] = band;
-    buffer.copy(payload, 1, offset, offset + take);
-    parts.push(encodePktLine(payload));
-    offset += take;
-  } while (offset < buffer.length);
-  return Buffer.concat(parts);
+    const take = Math.min(PKT_LINE_MAX_PAYLOAD - 1, data.length - source);
+    const length = take + 5;
+    writePktHeader(out, at, length);
+    out[at + 4] = band;
+    out.set(data.subarray(source, source + take), at + 5);
+    at += length;
+    source += take;
+  } while (source < data.length);
+  return at - offset;
 }

@@ -24,16 +24,16 @@ import {
   type GitObjectType,
   type ObjectLookup,
 } from './objects.ts';
-import { PackError, readPack, writePack } from './pack.ts';
+import { PackError, readPack, writePackWithOids } from './pack.ts';
 import {
   PktLineError,
   decodePktLines,
   encodePktLine,
   encodePktLines,
-  flushPacket,
   packetLines,
-  readPktLineSection,
-  sidebandPackets,
+  sidebandLength,
+  writePktHeader,
+  writeSidebandPackets,
   type PktLinePacket,
 } from './pktline.ts';
 
@@ -279,8 +279,10 @@ function commandOf(lines: readonly string[]): string {
 // upload-pack
 // ---------------------------------------------------------------------------------------------
 
+const V2_ADVERTISEMENT = v2Advertisement();
+
 function uploadPackV2Advertisement(): Buffer {
-  return v2Advertisement();
+  return V2_ADVERTISEMENT;
 }
 
 function handleLsRefs(repo: Repo, lines: readonly string[]): Buffer {
@@ -373,6 +375,22 @@ function gitCacheSet(store: Store, key: string, body: Buffer): void {
   store.gitCache.set(key, { revision, body });
 }
 
+/** One allocation for the whole reply: the prefix packets, the sidebanded pack and the final flush. */
+function encodeFetchResponse(prefixes: readonly Buffer[], pack: Buffer): Buffer {
+  let length = 4;
+  for (const prefix of prefixes) length += prefix.length;
+  length += sidebandLength(pack.length);
+  const out = Buffer.allocUnsafe(length);
+  let at = 0;
+  for (const prefix of prefixes) {
+    prefix.copy(out, at);
+    at += prefix.length;
+  }
+  at += writeSidebandPackets(out, at, 1, pack);
+  out.write('0000', at, 4, 'ascii');
+  return out;
+}
+
 function handleFetchV2(repo: Repo, lines: readonly string[], store: Store): Buffer {
   const request = parseFetchRequest(lines);
   const cacheKey = shallowFetchKey('v2', repo, request.wants, request.haves, request.shallow, request.depth);
@@ -381,25 +399,26 @@ function handleFetchV2(repo: Repo, lines: readonly string[], store: Store): Buff
     if (cached !== undefined) return cached;
   }
   const selection = selectFetch(repo, request.wants, request.haves, request.shallow, request.depth);
-  const pack = writePack(selection.objects.values());
-  const parts: Buffer[] = [];
+  // The selection is keyed by object id already; rehashing every object would only duplicate work.
+  const pack = writePackWithOids(
+    [...selection.objects].map(([oid, object]) => ({ oid, type: object.type, data: object.data })),
+  );
+  const prefixes: Buffer[] = [];
 
   // Acknowledgments are only meaningful when the client offered haves; the client's parser accepts
   // NAK and then a packfile section.  A clone (no haves) goes straight to the packfile.
   if (request.haves.length > 0) {
-    parts.push(encodePktLines(['acknowledgments\n', 'NAK\n', 'flush']));
+    prefixes.push(encodePktLines(['acknowledgments\n', 'NAK\n', 'flush']));
   }
   if (selection.shallow.length > 0 || selection.unshallow.length > 0) {
     const shallowItems: Array<string | 'flush'> = ['shallow-info\n'];
     for (const oid of selection.unshallow) shallowItems.push(`unshallow ${oid}\n`);
     for (const oid of selection.shallow) shallowItems.push(`shallow ${oid}\n`);
     shallowItems.push('flush');
-    parts.push(encodePktLines(shallowItems));
+    prefixes.push(encodePktLines(shallowItems));
   }
-  parts.push(encodePktLine('packfile\n'));
-  parts.push(sidebandPackets(1, pack));
-  parts.push(flushPacket());
-  const response = Buffer.concat(parts);
+  prefixes.push(encodePktLine('packfile\n'));
+  const response = encodeFetchResponse(prefixes, pack);
   if (cacheKey !== null) gitCacheSet(store, cacheKey, response);
   return response;
 }
@@ -427,14 +446,14 @@ function handleFetchV0(repo: Repo, packets: readonly PktLinePacket[], store: Sto
     if (cached !== undefined) return cached;
   }
   const selection = selectFetch(repo, wants, haves, shallow, depth);
-  const pack = writePack(selection.objects.values());
-  const parts: Buffer[] = [];
-  for (const oid of selection.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
-  for (const oid of selection.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-  parts.push(encodePktLine('NAK\n'));
-  parts.push(sidebandPackets(1, pack));
-  parts.push(flushPacket());
-  const response = Buffer.concat(parts);
+  const pack = writePackWithOids(
+    [...selection.objects].map(([oid, object]) => ({ oid, type: object.type, data: object.data })),
+  );
+  const prefixes: Buffer[] = [];
+  for (const oid of selection.unshallow) prefixes.push(encodePktLine(`unshallow ${oid}\n`));
+  for (const oid of selection.shallow) prefixes.push(encodePktLine(`shallow ${oid}\n`));
+  prefixes.push(encodePktLine('NAK\n'));
+  const response = encodeFetchResponse(prefixes, pack);
   if (cacheKey !== null) gitCacheSet(store, cacheKey, response);
   return response;
 }
@@ -449,24 +468,88 @@ interface PushCommand {
   readonly ref: string;
 }
 
-function parsePushCommands(lines: readonly string[]): { commands: PushCommand[]; caps: Set<string> } {
+interface ReceivePackCommands {
+  readonly commands: PushCommand[];
+  readonly caps: Set<string>;
+  readonly packOffset: number;
+}
+
+/**
+ * Walk the command section once.  The previous path made a packet object, a string per packet and
+ * an array of commands before parsing; a push carries one command, so all of that was overhead.
+ */
+function parseReceivePackBody(body: Buffer): ReceivePackCommands {
   const commands: PushCommand[] = [];
   const caps = new Set<string>();
-  lines.forEach((raw, index) => {
-    let line = raw.replace(/\r?\n$/, '');
-    if (line === '') return;
-    const nul = line.indexOf('\u0000');
-    if (nul >= 0) {
-      if (index === 0) {
-        for (const token of line.slice(nul + 1).split(' ')) if (token) caps.add(token);
-      }
-      line = line.slice(0, nul);
+  let offset = 0;
+  let index = 0;
+  let flushed = false;
+  while (offset < body.length) {
+    if (offset + 4 > body.length) throw new PktLineError('pkt-line header is truncated', 'pktline-truncated');
+    const text = body.toString('ascii', offset, offset + 4);
+    if (!/^[0-9a-fA-F]{4}$/.test(text)) {
+      throw new PktLineError(`pkt-line header ${JSON.stringify(text)} is not four hex digits`, 'pktline-header');
     }
-    const match = /^([0-9a-f]{40}) ([0-9a-f]{40}) (refs\/\S+)$/.exec(line);
-    if (match === null) throw new HttpError(400, 'Malformed receive-pack command');
-    commands.push({ oldOid: match[1] as string, newOid: match[2] as string, ref: match[3] as string });
-  });
-  return { commands, caps };
+    const length = Number.parseInt(text, 16);
+    if (length <= 2) {
+      offset += 4;
+      if (length === 0) flushed = true;
+      break;
+    }
+    if (length < 4) throw new PktLineError(`pkt-line length ${length} is invalid`, 'pktline-length');
+    if (offset + length > body.length) {
+      throw new PktLineError(`pkt-line at ${offset} declares ${length} bytes but ${body.length - offset} remain`, 'pktline-truncated');
+    }
+    let payload = body.subarray(offset + 4, offset + length);
+    offset += length;
+    if (payload.length > 0 && payload[payload.length - 1] === 0x0a) payload = payload.subarray(0, payload.length - 1);
+    if (payload.length > 0 && payload[payload.length - 1] === 0x0d) payload = payload.subarray(0, payload.length - 1);
+    if (payload.length > 0) {
+      const raw = payload.toString('utf8');
+      const nul = raw.indexOf('\u0000');
+      const line = nul >= 0 ? raw.slice(0, nul) : raw;
+      if (nul >= 0 && index === 0) {
+        for (const token of raw.slice(nul + 1).split(' ')) if (token) caps.add(token);
+      }
+      if (line !== '') {
+        const match = /^([0-9a-f]{40}) ([0-9a-f]{40}) (refs\/\S+)$/.exec(line);
+        if (match === null) throw new HttpError(400, 'Malformed receive-pack command');
+        commands.push({ oldOid: match[1] as string, newOid: match[2] as string, ref: match[3] as string });
+      }
+    }
+    index += 1;
+  }
+  if (!flushed) throw new HttpError(400, 'receive-pack command list has no flush');
+  if (commands.length === 0) throw new HttpError(400, 'receive-pack has no commands');
+  return { commands, caps, packOffset: offset };
+}
+
+function writePktLine(out: Buffer, at: number, text: string): number {
+  const bytes = Buffer.byteLength(text);
+  writePktHeader(out, at, bytes + 4);
+  out.write(text, at + 4, 'utf8');
+  return bytes + 4;
+}
+
+/** The report as one Buffer: pkt-lines in band 1 when side-band was negotiated, one final flush. */
+function encodePushReport(report: readonly string[], sideband: boolean): Buffer {
+  let innerLength = 4;
+  for (const line of report) innerLength += 4 + Buffer.byteLength(line);
+  if (!sideband) {
+    const out = Buffer.allocUnsafe(innerLength);
+    let at = 0;
+    for (const line of report) at += writePktLine(out, at, line);
+    out.write('0000', at, 4, 'ascii');
+    return out;
+  }
+  const inner = Buffer.allocUnsafe(innerLength);
+  let at = 0;
+  for (const line of report) at += writePktLine(inner, at, line);
+  inner.write('0000', at, 4, 'ascii');
+  const out = Buffer.allocUnsafe(sidebandLength(innerLength) + 4);
+  const used = writeSidebandPackets(out, 0, 1, inner);
+  out.write('0000', used, 4, 'ascii');
+  return out;
 }
 
 function applyPushCommands(
@@ -474,7 +557,7 @@ function applyPushCommands(
   store: Store,
   commands: readonly PushCommand[],
   unpackError: string | null,
-): Buffer {
+): string[] {
   const lookup = repoLookup(repo);
   const report: string[] = [unpackError === null ? 'unpack ok\n' : `unpack ${unpackError}\n`];
   let changed = false;
@@ -520,9 +603,14 @@ function applyPushCommands(
         reject('not a commit');
         continue;
       }
-      if (oldOid !== ZERO_OID && !isAncestor(oldOid, newOid, lookup)) {
-        reject('non-fast-forward');
-        continue;
+      if (oldOid !== ZERO_OID && oldOid !== newOid) {
+        // A push of one commit is overwhelmingly a direct child; only walk the graph when the new
+        // tip is not an immediate descendant of the old one.
+        const direct = parseCommit(target.data).parents.includes(oldOid);
+        if (!direct && !isAncestor(oldOid, newOid, lookup)) {
+          reject('non-fast-forward');
+          continue;
+        }
       }
     }
     repo.refs.set(ref, newOid);
@@ -535,17 +623,12 @@ function applyPushCommands(
     repo.updatedAt = stamp;
     repo.pushedAt = stamp;
   }
-  return encodePktLines([...report, 'flush']);
+  return report;
 }
 
 function handleReceivePack(repo: Repo, store: Store, body: Buffer): Buffer {
-  const section = readPktLineSection(body);
-  if (section.control !== 'flush') throw new HttpError(400, 'receive-pack command list has no flush');
-  const lines = packetLines(section.packets).map((line) => line.replace(/\r?\n$/, ''));
-  const { commands, caps } = parsePushCommands(lines);
-  if (commands.length === 0) throw new HttpError(400, 'receive-pack has no commands');
-
-  const packBytes = body.subarray(section.next);
+  const { commands, caps, packOffset } = parseReceivePackBody(body);
+  const packBytes = body.subarray(packOffset);
   let unpackError: string | null = null;
   if (packBytes.length > 0) {
     try {
@@ -558,11 +641,7 @@ function handleReceivePack(repo: Repo, store: Store, body: Buffer): Buffer {
     }
   }
 
-  const inner = applyPushCommands(repo, store, commands, unpackError);
-  if (caps.has('side-band-64k')) {
-    return Buffer.concat([sidebandPackets(1, inner), flushPacket()]);
-  }
-  return inner;
+  return encodePushReport(applyPushCommands(repo, store, commands, unpackError), caps.has('side-band-64k'));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -575,7 +654,17 @@ export function registerGitRoutes(router: Router, store: Store): void {
     const service = serviceOf(url.searchParams.get('service'));
     const wantsV2 = service === UPLOAD_PACK && /(?:^|[\s:])version=2(?:$|[\s:])/.test(headerText(req, 'git-protocol'));
     const contentType = `application/x-${service}-advertisement`;
-    const body = wantsV2 ? uploadPackV2Advertisement() : v0Advertisement(service, repo);
+    let body: Buffer | undefined;
+    if (wantsV2) {
+      body = V2_ADVERTISEMENT;
+    } else {
+      const key = `adv:${service}:${repo.owner}/${repo.name}`;
+      body = gitCacheGet(store, key);
+      if (body === undefined) {
+        body = v0Advertisement(service, repo);
+        gitCacheSet(store, key, body);
+      }
+    }
     sendBuffer(res, 200, body, { 'content-type': contentType, 'cache-control': 'no-cache' });
   });
 

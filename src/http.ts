@@ -27,14 +27,13 @@ export function sendJson(
   headers: Readonly<Record<string, string | number>> = {},
 ): void {
   if (res.headersSent) return;
-  // One UTF-8 encode and one write: Node would otherwise stringify, measure and encode separately.
-  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  const text = `${JSON.stringify(body)}\n`;
   res.writeHead(status, {
     'content-type': JSON_CONTENT_TYPE,
-    'content-length': payload.length,
+    'content-length': Buffer.byteLength(text),
     ...headers,
   });
-  res.end(payload);
+  res.end(text);
 }
 
 /** Write a bodiless reply (204, or an empty 200). */

@@ -6,7 +6,7 @@
 
 import { createHash } from 'node:crypto';
 import { inflateSync, deflateSync } from 'node:zlib';
-import { hashObject, type GitObject, type GitObjectType, type ObjectLookup } from './objects.ts';
+import { type GitObject, type GitObjectType, type ObjectLookup } from './objects.ts';
 
 const TYPE_CODE: Readonly<Record<GitObjectType, number>> = {
   commit: 1,
@@ -24,6 +24,11 @@ const CODE_TYPE: Readonly<Record<number, GitObjectType>> = {
 
 const OFS_DELTA = 6;
 const REF_DELTA = 7;
+
+/** Object id from the loose-object header and content, without allocating a separate header Buffer. */
+function hashObjectFast(type: GitObjectType, data: Uint8Array): string {
+  return createHash('sha1').update(`${type} ${data.length}\u0000`).update(data).digest('hex');
+}
 
 export class PackError extends Error {
   readonly code: string;
@@ -53,10 +58,11 @@ export interface PackReadResult {
 
 /** `inflateSync` with `info: true` reports how many input bytes the stream consumed. */
 function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
-  const view = buffer.subarray(offset);
   let result: { buffer: Buffer; engine: { bytesWritten: number } };
   try {
-    result = inflateSync(view, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    // The stream ends at its own zlib trailer, so it never reads into the pack trailer or the next
+    // entry.  One subarray instead of slicing the whole body and then slicing again at `offset`.
+    result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
   } catch (err) {
     throw new PackError(`zlib stream at offset ${offset} did not inflate: ${(err as Error).message}`, 'pack-zlib');
   }
@@ -224,7 +230,7 @@ export function readPack(pack: Uint8Array, options: ReadPackOptions = {}): PackR
       baseOid = buffer.subarray(offset, offset + 20).toString('hex');
       offset += 20;
     }
-    const inflated = inflateAt(buffer.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(buffer, offset);
     if (inflated.data.length !== header.size) {
       throw new PackError(
         `pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`,
@@ -252,7 +258,7 @@ export function readPack(pack: Uint8Array, options: ReadPackOptions = {}): PackR
   const settle = (entry: RawEntry, type: GitObjectType, data: Buffer): void => {
     entry.resolvedType = type;
     entry.resolvedData = data;
-    entry.resolvedOid = hashObject(type, data);
+    entry.resolvedOid = hashObjectFast(type, data);
     resolvedByOid.set(entry.resolvedOid, entry);
   };
 
@@ -338,15 +344,13 @@ function writeEntryHeader(typeCode: number, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
-/**
- * Build a valid packfile from whole objects.  Entries are ordered by their object id so the same
- * object set always produces the same bytes; the trailer is the SHA-1 of every preceding byte.
- */
-export function writePack(objects: Iterable<PackObjectInput>): Buffer {
-  const list = [...objects].map((object) => {
-    const data = Buffer.from(object.data);
-    return { type: object.type, data, oid: hashObject(object.type, data) };
-  });
+interface PackedEntry {
+  readonly type: GitObjectType;
+  readonly data: Buffer;
+  readonly oid: string;
+}
+
+function packFromList(list: PackedEntry[]): Buffer {
   list.sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
 
   const header = Buffer.allocUnsafe(12);
@@ -357,8 +361,32 @@ export function writePack(objects: Iterable<PackObjectInput>): Buffer {
   for (const object of list) {
     const code = TYPE_CODE[object.type];
     parts.push(writeEntryHeader(code, object.data.length));
-    parts.push(deflateSync(object.data, { level: 1 }));
+    parts.push(deflateSync(object.data));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+}
+
+/**
+ * Build a valid packfile from whole objects.  Entries are ordered by their object id so the same
+ * object set always produces the same bytes; the trailer is the SHA-1 of every preceding byte.
+ */
+export function writePack(objects: Iterable<PackObjectInput>): Buffer {
+  return packFromList(
+    [...objects].map((object) => {
+      const data = Buffer.from(object.data);
+      return { type: object.type, data, oid: hashObjectFast(object.type, data) };
+    }),
+  );
+}
+
+export interface PackObjectWithOid extends PackObjectInput {
+  readonly oid: string;
+}
+
+/** Same bytes as `writePack`, for callers whose object ids are already known (the store's keys). */
+export function writePackWithOids(objects: Iterable<PackObjectWithOid>): Buffer {
+  return packFromList(
+    [...objects].map((object) => ({ type: object.type, data: Buffer.from(object.data), oid: object.oid })),
+  );
 }

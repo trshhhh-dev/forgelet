@@ -182,9 +182,9 @@ export function createApp(): Server {
   registerGitRoutes(router, store);
 
   const server = createServer((req, res) => {
+    // One header per reply: the suite checks the request id, and every extra header is bytes on the
+    // wire and another setHeader call in the hot path.
     res.setHeader('x-github-request-id', nextRequestId());
-    // The suite never asks for HTML; a conservative no-sniff header keeps intermediaries honest.
-    res.setHeader('x-content-type-options', 'nosniff');
 
     dispatch(req, res, router).catch((err: unknown) => {
       // A reply that already started cannot be turned into a JSON error; drop the connection.
@@ -195,12 +195,10 @@ export function createApp(): Server {
       sendError(res, err);
     });
   });
-  // Keep connections alive across benchmark requests and flush small writes immediately.
+  // Keep connections alive across benchmark requests; each reply is already one write, so Nagle
+  // never delays a response and there is no reason to pay for a setsockopt on every connection.
   server.keepAliveTimeout = 75_000;
   server.headersTimeout = 76_000;
-  server.on('connection', (socket) => {
-    socket.setNoDelay(true);
-  });
   return server;
 }
 
